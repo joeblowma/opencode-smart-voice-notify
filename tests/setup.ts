@@ -16,6 +16,7 @@ import type {
   ToastCall,
 } from '../src/types/testing.js';
 import type { PluginEvent, ShellResult } from '../src/types/opencode-sdk.js';
+import { resetPowerShellRunner, setPowerShellRunner } from '../src/util/powershell.js';
 
 const TEST_TEMP_BASE = path.join(os.tmpdir(), 'opencode-smart-voice-notify-tests');
 
@@ -200,6 +201,9 @@ export function createMockShellRunner(options: MockShellRunnerOptions = {}): Moc
 
   mockRunner.getCalls = () => [...calls];
   mockRunner.getLastCall = () => calls[calls.length - 1];
+  // PowerShell invocations bypass the shell runner (see src/util/powershell.ts);
+  // mirror them here so they are visible alongside the runner's own calls.
+  setShellCallSink((record) => calls.push(record));
   mockRunner.getCallCount = () => calls.length;
   mockRunner.reset = () => {
     calls.length = 0;
@@ -382,11 +386,44 @@ afterAll(() => {
 
 beforeEach(() => {
   process.env.NODE_ENV = 'test';
+  // Windows audio, SAPI, volume and idle probes all run PowerShell scripts
+  // (see src/util/powershell.ts).  Swap in a recording fake so no test ever
+  // spawns a real PowerShell process or plays real audio.
+  installPowerShellRecorder();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await disposeTrackedPlugins();
+  uninstallPowerShellRecorder();
   cleanupTestTempDir();
 });
+
+// ============================================================
+// Plugin lifetime tracking
+// ============================================================
+// Several e2e tests create a plugin and never dispose it, so its reminder
+// timers keep firing during *later* tests.  Previously that was invisible
+// (each plugin held its own shell runner), but now PowerShell calls land in a
+// process-wide recorder, so a stale timer would show up in an unrelated test's
+// call list.  `trackPlugin` disposes everything it created after each test.
+
+const trackedPlugins: Array<{ dispose?: () => void | Promise<void> }> = [];
+
+export function trackPlugin<T extends { dispose?: () => void | Promise<void> }>(plugin: T): T {
+  trackedPlugins.push(plugin);
+  return plugin;
+}
+
+async function disposeTrackedPlugins(): Promise<void> {
+  while (trackedPlugins.length > 0) {
+    const plugin = trackedPlugins.pop();
+    try {
+      await plugin?.dispose?.();
+    } catch {
+      // ignore
+    }
+  }
+}
 
 export function createConsoleCapture(): ConsoleCapture {
   const logs: ConsoleCaptureStore = {
@@ -453,12 +490,145 @@ export const isWindows = platform === 'win32';
 export const isMacOS = platform === 'darwin';
 export const isLinux = platform === 'linux';
 
+// ============================================================
+// PowerShell recorder
+// ============================================================
+// Windows playback, SAPI, volume and idle probes all run PowerShell scripts
+// through `src/util/powershell.ts`, which spawns `powershell.exe` directly
+// with an argv vector (passing the script through a shell corrupts it — see the
+// module comment).  That means the calls no longer show up on the mock `$`
+// shell runner, so the recorder below stands in for it and lets the existing
+// call-count assertions keep working.
+//
+//   installPowerShellRecorder()  – install a fake runner (call in beforeEach)
+//   uninstallPowerShellRecorder() – restore the real runner
+//   getPowerShellCalls()          – recorded scripts as ShellCallRecord-like
+//   scriptRunner({ exitCode, stdout, stderr }) – configure the fake's reply
+
+interface PowerShellRecorderState {
+  calls: ShellCallRecord[];
+  /** Parallel to `calls`: whether the record was mirrored into a mock shell. */
+  mirrored: boolean[];
+  result: { exitCode: number; stdout: string; stderr: string };
+  respond: Array<{ match: RegExp; exitCode?: number; stdout?: string; stderr?: string }>;
+}
+
+const powershellRecorder: PowerShellRecorderState = {
+  calls: [],
+  mirrored: [],
+  result: { exitCode: 0, stdout: '', stderr: '' },
+  respond: [],
+};
+
+/**
+ * Where PowerShell calls should also be recorded.
+ *
+ * PowerShell now runs through `src/util/powershell.ts` instead of the `$` shell
+ * runner, but conceptually it is still just "the plugin ran a command", so the
+ * recorder mirrors every script into the active mock shell runner.  That keeps
+ * existing assertions like `mockShell.wasCalledWith('powershell.exe')` valid
+ * without every test having to learn about a second call channel.
+ */
+let shellCallSink: ((record: ShellCallRecord) => void) | null = null;
+
+export function setShellCallSink(sink: ((record: ShellCallRecord) => void) | null): void {
+  shellCallSink = sink;
+}
+
+/** Configure how the fake PowerShell runner replies to the next script(s). */
+export function scriptRunner(result: {
+  exitCode?: number;
+  stdout?: string;
+  stderr?: string;
+  /**
+   * Per-script replies matched against the script body.  Needed because the
+   * idle probe, the volume probe and the playback scripts all share one
+   * runner, and they have to return different stdout.
+   */
+  respond?: Array<{ match: RegExp | string; exitCode?: number; stdout?: string; stderr?: string }>;
+}): void {
+  powershellRecorder.result = {
+    exitCode: result.exitCode ?? powershellRecorder.result.exitCode,
+    stdout: result.stdout ?? powershellRecorder.result.stdout,
+    stderr: result.stderr ?? powershellRecorder.result.stderr,
+  };
+  if (result.respond) {
+    powershellRecorder.respond = result.respond.map((entry) => ({
+      match: typeof entry.match === 'string' ? new RegExp(escapeRegExp(entry.match)) : entry.match,
+      exitCode: entry.exitCode,
+      stdout: entry.stdout,
+      stderr: entry.stderr,
+    }));
+  }
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const renderPowerShellCommand = (script: string): string =>
+  `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ${script}`;
+
+export function installPowerShellRecorder(): void {
+  powershellRecorder.calls = [];
+  powershellRecorder.mirrored = [];
+  powershellRecorder.respond = [];
+  setPowerShellRunner(async (script) => {
+    const record: ShellCallRecord = {
+      command: renderPowerShellCommand(script),
+      timestamp: Date.now(),
+    };
+    powershellRecorder.calls.push(record);
+    powershellRecorder.mirrored.push(shellCallSink !== null);
+    shellCallSink?.(record);
+
+    const reply = powershellRecorder.respond.find((entry) => entry.match.test(script));
+    return {
+      stdout: reply?.stdout ?? powershellRecorder.result.stdout,
+      stderr: reply?.stderr ?? powershellRecorder.result.stderr,
+      exitCode: reply?.exitCode ?? powershellRecorder.result.exitCode,
+    };
+  });
+}
+
+export function uninstallPowerShellRecorder(): void {
+  shellCallSink = null;
+  resetPowerShellRunner();
+}
+
+/** Recorded PowerShell scripts, shaped like shell-runner calls for assertions. */
+export function getPowerShellCalls(): ShellCallRecord[] {
+  return [...powershellRecorder.calls];
+}
+
+/** Reset the recorded calls without uninstalling the fake. */
+export function resetPowerShellCalls(): void {
+  powershellRecorder.calls = [];
+  powershellRecorder.mirrored = [];
+}
+
+/** True when `cmd` is the WPF (.NET) or MCI playback backend. */
+const isPlaybackScript = (cmd: string): boolean =>
+  cmd.includes('System.Windows.Media.MediaPlayer') || cmd.includes('mciSendString');
+
+/** True when `cmd` is the Windows SAPI speech-synthesis backend. */
+const isSpeechScript = (cmd: string): boolean => cmd.includes('System.Speech') && cmd.includes('SpeakSsml');
+
+/**
+ * Shell-runner calls plus any recorded PowerShell scripts that were not mirrored
+ * into that runner (e.g. when a test builds the TTS factory without a `$`).
+ */
+function collectRecordedCalls(shell: MockShellRunner): ShellCallRecord[] {
+  const unmirrored = getPowerShellCalls().filter((_, index) => !powershellRecorder.mirrored[index]);
+  return [...shell.getCalls(), ...unmirrored];
+}
+
 export function getTTSCalls(shell: MockShellRunner): ShellCallRecord[] {
-  return shell.getCalls().filter((record) => {
+  return collectRecordedCalls(shell).filter((record) => {
     const cmd = record.command;
 
-    if (cmd.includes('powershell.exe') && cmd.includes('-File') && cmd.includes('.ps1')) {
-      return true;
+    if (cmd.includes('powershell.exe')) {
+      return isPlaybackScript(cmd) || isSpeechScript(cmd);
     }
 
     if (cmd.includes('paplay') || cmd.includes('aplay') || cmd.includes('afplay')) {
@@ -469,24 +639,16 @@ export function getTTSCalls(shell: MockShellRunner): ShellCallRecord[] {
       return true;
     }
 
-    if (cmd.includes('System.Windows.Media.MediaPlayer') || cmd.includes('mciSendString')) {
-      return true;
-    }
-
     return false;
   });
 }
 
 export function getAudioCalls(shell: MockShellRunner): ShellCallRecord[] {
-  return shell.getCalls().filter((record) => {
+  return collectRecordedCalls(shell).filter((record) => {
     const cmd = record.command;
 
-    if (cmd.includes('System.Windows.Media.MediaPlayer') || cmd.includes('mciSendString')) {
-      return true;
-    }
-
-    if (cmd.includes('powershell.exe') && cmd.includes('-File') && cmd.includes('.ps1')) {
-      return true;
+    if (cmd.includes('powershell.exe')) {
+      return isPlaybackScript(cmd) || isSpeechScript(cmd);
     }
 
     if (cmd.includes('edge-tts') && cmd.includes('--write-media')) {
@@ -534,6 +696,7 @@ export default {
   wait,
   waitFor,
   createConsoleCapture,
+  trackPlugin,
   platform,
   isWindows,
   isMacOS,
@@ -542,4 +705,9 @@ export default {
   getAudioCalls,
   getTestTTSEngine,
   wasTTSCalled,
+  installPowerShellRecorder,
+  uninstallPowerShellRecorder,
+  getPowerShellCalls,
+  resetPowerShellCalls,
+  scriptRunner,
 };

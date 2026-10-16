@@ -12,6 +12,7 @@ import {
   createMockShellRunner,
   createMockClient,
   mockEvents,
+  trackPlugin,
   wait,
   wasTTSCalled,
   getTTSCalls,
@@ -38,22 +39,22 @@ describe('Plugin E2E (Plugin Core)', () => {
   describe('Initialization', () => {
     test('should disable plugin when enabled is false', async () => {
       createTestConfig(createMinimalConfig({ enabled: false }));
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       expect(plugin).toEqual({});
     });
     
     test('should register event handler when enabled', async () => {
       createTestConfig(createMinimalConfig({ enabled: true }));
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       expect(plugin.event).toBeDefined();
       expect(typeof plugin.event).toBe('function');
@@ -70,11 +71,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         enableToast: true
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       const event = mockEvents.sessionIdle('session-123');
       await plugin.event({ event });
@@ -99,11 +100,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         ttsEngine: 'sapi' // Use SAPI on Windows for reliable offline testing
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       const event = mockEvents.sessionIdle('session-123');
       await plugin.event({ event });
@@ -125,11 +126,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         idleSound: 'assets/test-sound.mp3'
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       const event = mockEvents.sessionIdle('session-123');
       await plugin.event({ event });
@@ -151,11 +152,11 @@ describe('Plugin E2E (Plugin Core)', () => {
       // Set up mock session as a sub-session
       mockClient.session.setMockSession('sub-session-123', { parentID: 'main-session' });
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       const event = mockEvents.sessionIdle('sub-session-123');
       await plugin.event({ event });
@@ -179,11 +180,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         idleSound: 'assets/test-sound.mp3'
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       // Fire multiple idle events for the SAME session in rapid succession
       // (simulating the Linux bug where SDK fires duplicates within ~100ms)
@@ -214,11 +215,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         idleSound: 'assets/test-sound.mp3'
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       // Fire idle events for DIFFERENT sessions
       await plugin.event({ event: mockEvents.sessionIdle('session-A') });
@@ -238,11 +239,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         idleSound: 'assets/test-sound.mp3'
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       const sessionId = 'session-debounce-expiry';
       
@@ -267,11 +268,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         idleSound: 'assets/test-sound.mp3'
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       const sessionId = 'session-reset-test';
       
@@ -299,11 +300,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         ttsEngine: 'edge' // Use Edge TTS which works cross-platform
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       const event = mockEvents.sessionIdle('session-123');
       await plugin.event({ event });
@@ -330,11 +331,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         permissionBatchWindowMs: 100
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       // Fire multiple permissions rapidly
       await plugin.event({ event: mockEvents.permissionAsked('p1', 's1') });
@@ -365,11 +366,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         ttsEngine: 'sapi'
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       // Fire permission
       await plugin.event({ event: mockEvents.permissionAsked('p1', 's1') });
@@ -398,11 +399,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         questionBatchWindowMs: 100
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       // Fire two question requests: one with 1 question, one with 2 questions
       await plugin.event({ event: mockEvents.questionAsked('q1', 's1', [{ text: 'Q1' }]) });
@@ -426,11 +427,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         ttsEngine: 'sapi'
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       // Fire idle event
       await plugin.event({ event: mockEvents.sessionIdle('s1') });
@@ -459,11 +460,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         ttsEngine: 'sapi'
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       // Fire a user message BEFORE idle (seen)
       await plugin.event({ event: mockEvents.messageUpdated('m1', 'user', 's1') });
@@ -479,9 +480,12 @@ describe('Plugin E2E (Plugin Core)', () => {
       // Wait long enough for reminder to fire (0.5s)
       await wait(1000);
       
-      // Reminder SHOULD have fired (via SAPI script)
+      // Reminder SHOULD have fired (via a PowerShell TTS script).
+      // SAPI used to be written to a temp .ps1 and invoked with `-File`; the
+      // script is now passed straight to powershell.exe as a single -Command
+      // argument, so assert on the script body instead of a file path.
       expect(mockShell.wasCalledWith('powershell.exe')).toBe(true);
-      expect(mockShell.wasCalledWith('.ps1')).toBe(true);
+      expect(mockShell.wasCalledWith('SpeakSsml')).toBe(true);
     });
   });
 
@@ -493,11 +497,11 @@ describe('Plugin E2E (Plugin Core)', () => {
         permissionBatchWindowMs: 1000 // Long window
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       // Start a batch
       await plugin.event({ event: mockEvents.permissionAsked('p1', 's1') });

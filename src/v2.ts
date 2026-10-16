@@ -168,22 +168,41 @@ export const getSessionLocation = (sessionID: string | undefined): string | unde
 
 const isWindows = process.platform === 'win32';
 
-/** Quote a single interpolated value so it survives the shell as one argument. */
-const quoteValue = (value: unknown): string => {
+/**
+ * Quote a single interpolated value for a POSIX shell.
+ *
+ * This is only used on the `sh -c` fallback path.  When a command can be
+ * spawned directly (the common case) the value travels as a real argv element
+ * and needs no quoting at all.
+ */
+const quotePosixValue = (value: unknown): string => {
   const text = value === undefined || value === null ? '' : String(value);
-  if (isWindows) {
-    // cmd.exe: wrap in double quotes, escape embedded double quotes.
-    return `"${text.replace(/"/g, '\\"')}"`;
-  }
-  // POSIX: single-quote, escaping embedded single quotes.
   return `'${text.replace(/'/g, `'\\''`)}'`;
 };
 
 /**
- * Build a shell command string from a tagged-template call.  Static template
- * parts are emitted verbatim (so shell syntax such as quotes keeps working)
- * while interpolated values are quoted to become exactly one argument each —
- * matching the semantics the plugin was written against.
+ * Quote a single interpolated value so it survives `cmd.exe` as one argument.
+ *
+ * `cmd.exe` has no backslash escapes, so the previous implementation's
+ * `"${text.replace(/"/g, '\\"')}"` produced a literal `\"` in front of every
+ * value — `where sleep` became `where \"sleep\"` and looked for a file whose
+ * name literally contained quotes.  Caret-escaping cmd metacharacters and
+ * doubling embedded quotes is the correct cmd quoting.
+ */
+const quoteCmdValue = (value: unknown): string => {
+  const text = value === undefined || value === null ? '' : String(value);
+  // Inside a double-quoted cmd token, only `%` and `!` still need escaping.
+  const escaped = text.replace(/([%!])/g, '^$1').replace(/"/g, '""');
+  return `"${escaped}"`;
+};
+
+const quoteValue = (value: unknown): string => (isWindows ? quoteCmdValue(value) : quotePosixValue(value));
+
+/**
+ * Build a shell command string from a tagged-template call.
+ *
+ * Only used on the shell fallback path.  On the direct-spawn path (the common
+ * case) interpolated values travel as real argv elements and need no quoting.
  */
 const buildCommand = (strings: TemplateStringsArray, values: Array<unknown>): string => {
   let command = strings[0] ?? '';
@@ -194,27 +213,216 @@ const buildCommand = (strings: TemplateStringsArray, values: Array<unknown>): st
   return command;
 };
 
-/** Create a single shell execution: a thenable with `.quiet()/.nothrow()/.timeout()`. */
-const createShellExecution = (command: string): ShellExecution => {
+/**
+ * `cmd.exe` builtins — these have no executable on disk, so a direct spawn of
+ * the "binary" would fail with ENOENT and they must go through the shell.
+ */
+const WINDOWS_SHELL_BUILTINS = new Set([
+  'assoc', 'break', 'call', 'cd', 'chdir', 'cls', 'color', 'copy', 'date', 'del', 'dir', 'echo', 'endlocal',
+  'erase', 'exit', 'for', 'ftype', 'goto', 'if', 'md', 'mkdir', 'mklink', 'move', 'path', 'pause', 'popd',
+  'prompt', 'pushd', 'rd', 'ren', 'rename', 'rm', 'rmdir', 'set', 'setlocal', 'shift', 'start', 'time',
+  'title', 'type', 'ver', 'verify', 'vol',
+]);
+
+/** Characters `cmd.exe` treats as syntax rather than as ordinary argument text. */
+const CMD_METACHARACTERS = /[|<>&^()!,;\r\n]/;
+
+interface ParsedCommand {
+  /** Executable name taken from the static template text. */
+  bin: string;
+  /** Argument vector: static tokens plus interpolated values, in order. */
+  args: string[];
+  /** True when the command genuinely needs `cmd.exe` to interpret it. */
+  needsShell: boolean;
+}
+
+/**
+ * Tokenise the *static* template text into argv entries.
+ *
+ * Quoted runs are unwrapped and kept together, and characters inside them do
+ * not count as shell syntax — otherwise `osascript -e "set volume to 100"`
+ * would look like a redirection.
+ */
+const tokeniseStatic = (text: string): { tokens: string[]; needsShell: boolean } => {
+  const tokens: string[] = [];
+  let current = '';
+  let hasCurrent = false;
+  let quoteChar: '"' | "'" | undefined;
+  let needsShell = false;
+
+  const push = (): void => {
+    if (hasCurrent) {
+      tokens.push(current);
+      current = '';
+      hasCurrent = false;
+    }
+  };
+
+  for (const char of text) {
+    if (quoteChar) {
+      if (char === quoteChar) {
+        quoteChar = undefined;
+      } else {
+        current += char;
+      }
+      hasCurrent = true;
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quoteChar = char;
+      hasCurrent = true;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      push();
+      continue;
+    }
+
+    if (isWindows && CMD_METACHARACTERS.test(char)) {
+      needsShell = true;
+    }
+    current += char;
+    hasCurrent = true;
+  }
+
+  push();
+  return { tokens, needsShell };
+};
+
+/**
+ * Parse a tagged-template call into an executable plus an argument vector.
+ *
+ * Static template text supplies the program name and literal flags; every
+ * interpolated value becomes exactly one argument, untouched.
+ */
+const parseCommand = (strings: TemplateStringsArray, values: Array<unknown>): ParsedCommand => {
+  const tokens: string[] = [];
+  let needsShell = false;
+
+  const appendStatic = (text: string): void => {
+    const parsed = tokeniseStatic(text);
+    if (parsed.needsShell) needsShell = true;
+    tokens.push(...parsed.tokens);
+  };
+
+  appendStatic(strings[0] ?? '');
+  for (let i = 0; i < values.length; i++) {
+    const value = values[i];
+    tokens.push(value === undefined || value === null ? '' : String(value));
+    appendStatic(strings[i + 1] ?? '');
+  }
+
+  const bin = tokens.shift() ?? '';
+  if (bin && WINDOWS_SHELL_BUILTINS.has(bin.toLowerCase())) {
+    needsShell = true;
+  }
+
+  return { bin, args: tokens, needsShell };
+};
+
+/** Kill a child and everything it spawned — `child.kill()` leaves grandchildren alive on Windows. */
+const killProcessTree = (child: ReturnType<typeof spawn>): void => {
+  if (!child.pid) return;
+  if (isWindows) {
+    try {
+      spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+    } catch {
+      // Fall through to the plain kill below.
+    }
+  }
+  try {
+    child.kill();
+  } catch {
+    // Best effort.
+  }
+};
+
+/**
+ * Create a single shell execution: a thenable with `.quiet()/.nothrow()/.timeout()`.
+ *
+ * On Windows the command is spawned directly with an argv vector whenever the
+ * static template text is free of `cmd.exe` syntax and the program is not a
+ * shell builtin.  That matters: routing through `cmd.exe /d /s /c` corrupts
+ * *every* quoted argument (including ones in the static text), which is what
+ * made the PowerShell snippets fail to parse.  The direct path also removes
+ * the 8191-character command-line limit and avoids a console window flash,
+ * since the child is always spawned with `windowsHide`.
+ *
+ * Commands that really do need shell interpretation (pipes, redirection,
+ * builtins like `exit`) fall back to the shell.
+ *
+ * Note that multi-line scripts (all PowerShell snippets in this plugin) must
+ * NOT be passed through here — see `src/util/powershell.ts`.
+ */
+const createShellExecution = (parsed: ParsedCommand, shellCommand: string): ShellExecution => {
   let nothrow = false;
   let timedOut = false;
+  let settled = false;
   let child: ReturnType<typeof spawn> | undefined;
 
-  const shellBin = isWindows ? process.env.ComSpec ?? 'cmd.exe' : process.env.SHELL ?? '/bin/sh';
-  const shellArgs = isWindows ? ['/d', '/s', '/c', command] : ['-c', command];
+  const useShell = !isWindows || parsed.needsShell;
+  const bin = useShell ? (isWindows ? process.env.ComSpec ?? 'cmd.exe' : process.env.SHELL ?? '/bin/sh') : parsed.bin;
+  // `/s` is deliberately not used: it strips the outer quotes of the whole
+  // command string, which mangles any quoted argument inside it.
+  const args = useShell
+    ? isWindows
+      ? ['/d', '/c', shellCommand]
+      : ['-c', shellCommand]
+    : parsed.args;
+
+  /** Resolves/rejects the promise below; kept outside so `.timeout()` can force it. */
+  let forceFinish: ((result: ShellResult) => void) | undefined;
 
   const promise = new Promise<ShellResult>((resolve, reject) => {
     const stdoutChunks: Array<Buffer> = [];
     const stderrChunks: Array<Buffer> = [];
 
+    const buildResult = (exitCode: number): ShellResult => {
+      const stdout = Buffer.concat(stdoutChunks);
+      const stderr = Buffer.concat(stderrChunks);
+      return {
+        stdout,
+        stderr,
+        exitCode,
+        text: (enc?: BufferEncoding) => stdout.toString(enc),
+        toString: () => stdout.toString(),
+      };
+    };
+
+    const finish = (result: ShellResult, error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      // Reject on a spawn failure *or* a non-zero exit, unless `.nothrow()` was
+      // requested — callers rely on this to detect failures without inspecting
+      // the resolved result.
+      if (!nothrow && (error || result.exitCode !== 0)) {
+        const message =
+          result.stderr.toString().trim() ||
+          error?.message ||
+          `Command failed with exit code ${result.exitCode}`;
+        reject(Object.assign(new Error(message), result));
+        return;
+      }
+      resolve(result);
+    };
+
+    forceFinish = (result: ShellResult) => finish(result);
+
     try {
-      child = spawn(shellBin, shellArgs, {
+      child = spawn(bin, args, {
         cwd: process.cwd(),
         env: process.env,
         stdio: ['ignore', 'pipe', 'pipe'],
+        // Never flash a console window for a background notification.
+        windowsHide: true,
       });
     } catch (error) {
-      reject(error);
+      finish(buildResult(127), error as Error);
       return;
     }
 
@@ -222,33 +430,11 @@ const createShellExecution = (command: string): ShellExecution => {
     child.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(Buffer.from(chunk)));
 
     child.on('error', (error) => {
-      const stdout = Buffer.concat(stdoutChunks);
-      const stderr = Buffer.concat(stderrChunks);
-      if (nothrow) {
-        resolve({ stdout, stderr, exitCode: 127, text: (enc?: BufferEncoding) => stdout.toString(enc), toString: () => stdout.toString() });
-        return;
-      }
-      reject(Object.assign(error, { stdout, stderr, exitCode: 127 }));
+      finish(buildResult(127), error);
     });
 
     child.on('close', (code: number | null) => {
-      const stdout = Buffer.concat(stdoutChunks);
-      const stderr = Buffer.concat(stderrChunks);
-      const exitCode = timedOut ? 124 : code ?? 1;
-      const result: ShellResult = {
-        stdout,
-        stderr,
-        exitCode,
-        text: (enc?: BufferEncoding) => stdout.toString(enc),
-        toString: () => stdout.toString(),
-      };
-
-      if (exitCode !== 0 && !nothrow) {
-        const message = stderr.toString().trim() || `Command failed with exit code ${exitCode}`;
-        reject(Object.assign(new Error(message), result));
-        return;
-      }
-      resolve(result);
+      finish(buildResult(timedOut ? 124 : code ?? 1));
     });
   });
 
@@ -261,7 +447,14 @@ const createShellExecution = (command: string): ShellExecution => {
   execution.timeout = (milliseconds: number) => {
     const timer = setTimeout(() => {
       timedOut = true;
-      child?.kill('SIGKILL');
+      if (child) killProcessTree(child);
+      // A killed shell can leave a grandchild holding the stdout pipe open, in
+      // which case 'close' never fires and the caller waits forever.  Settle
+      // regardless so a timeout always means "timed out".
+      const bail = setTimeout(() => {
+        forceFinish?.({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 124 });
+      }, 2000);
+      (bail as { unref?: () => void }).unref?.();
     }, milliseconds);
     // Do not keep the event loop alive purely for the timeout.
     (timer as { unref?: () => void }).unref?.();
@@ -274,7 +467,7 @@ const createShellExecution = (command: string): ShellExecution => {
 /** Synthesise a V1-compatible `$` shell runner for the V2 context. */
 export const createShellRunner = (): ShellRunner => {
   const runner = ((strings: TemplateStringsArray, ...values: Array<unknown>): ShellExecution =>
-    createShellExecution(buildCommand(strings, values))) as ShellRunner;
+    createShellExecution(parseCommand(strings, values), buildCommand(strings, values))) as ShellRunner;
   return runner;
 };
 

@@ -50,14 +50,20 @@ mock.module('msedge-tts', () => ({
 import { getTTSConfig, createTTS } from '../../src/util/tts.js';
 import { 
   createTestTempDir, 
-  cleanupTestTempDir, 
+  cleanupTestTempDir,
   getTestTempDir,
   createTestConfig,
   createMinimalConfig,
   createMockShellRunner,
   createMockClient,
-  testFileExists
+  testFileExists,
+  getPowerShellCalls,
+  scriptRunner
 } from '../setup.js';
+
+/** The recorded PowerShell scripts, newest last. */
+const psScripts = () => getPowerShellCalls().map((call) => call.command);
+const lastPsScript = () => psScripts().at(-1) ?? '';
 
 describe('tts.js', () => {
   describe('getTTSConfig()', () => {
@@ -163,48 +169,109 @@ describe('tts.js', () => {
       return tts;
     };
 
-    it('should call powershell MCI playback on win32', async () => {
-      // Assuming we are on win32 as per environment
+    it('should play via the .NET MediaPlayer backend on win32', async () => {
+      // .NET is the first Windows backend; the rest are fallbacks.
       if (process.platform === 'win32') {
         await tts.playAudioFile('test.mp3');
-        expect(mockShell.getCallCount()).toBe(1);
-        expect(mockShell.getLastCall().command).toContain('powershell.exe');
-        expect(mockShell.getLastCall().command).toContain('mciSendString');
-        expect(mockShell.getLastCall().command).toContain('test.mp3');
+        expect(psScripts()).toHaveLength(1);
+        expect(lastPsScript()).toContain('powershell.exe');
+        expect(lastPsScript()).toContain('System.Windows.Media.MediaPlayer');
+        expect(lastPsScript()).toContain('test.mp3');
+        expect(lastPsScript()).not.toContain('mciSendString');
+      }
+    });
+
+    it('should fall back through the backend chain when the first backend fails', async () => {
+      if (process.platform === 'win32') {
+        scriptRunner({ exitCode: 1, stderr: 'simulated .NET failure' });
+
+        await tts.playAudioFile('test.mp3');
+
+        const scripts = psScripts();
+        expect(scripts.length).toBeGreaterThanOrEqual(2);
+        expect(scripts[0]).toContain('System.Windows.Media.MediaPlayer');
+        expect(scripts[1]).toContain('mciSendString');
+        // The final fallback hands off to the user's default media player.
+        expect(scripts.at(-1)).toContain('Start-Process');
+        scriptRunner({ exitCode: 0, stderr: '' });
+      }
+    });
+
+    it('should remember failing backends instead of retrying them every time', async () => {
+      if (process.platform === 'win32') {
+        scriptRunner({ exitCode: 1, stderr: 'everything is broken' });
+
+        await tts.playAudioFile('test.mp3');
+        const firstPass = psScripts().length;
+
+        await tts.playAudioFile('test.mp3');
+        // A backend that keeps failing must not be probed again on every
+        // notification — each retry of WPF MediaPlayer costs seconds.
+        expect(psScripts().length).toBeLessThan(firstPass * 2);
+
+        scriptRunner({ exitCode: 0, stderr: '' });
       }
     });
 
     it('should respect loops parameter on win32', async () => {
       if (process.platform === 'win32') {
         await tts.playAudioFile('test.mp3', 3);
-        expect(mockShell.getCallCount()).toBe(1); // One powershell call with a loop inside
-        expect(mockShell.getLastCall().command).toContain('-lt 3');
+        expect(psScripts()).toHaveLength(1); // One powershell call with a loop inside
+        expect(lastPsScript()).toContain('-lt 3');
       }
     });
 
-    it('should use direct PowerShell execution when the OpenCode shell runner is unavailable on win32', async () => {
+    it('should run PowerShell directly even when the shell runner is unavailable', async () => {
       if (process.platform === 'win32') {
-        mockExecFile.mockClear();
+        // PowerShell scripts must never be interpolated into a shell command
+        // string: a shell round-trip mangles the embedded quotes and here-strings.
         tts = createTTS({ client: createMockClient() });
+        const unusedShell = createMockShellRunner();
 
         await tts.playAudioFile('C:\\temp\\notify.mp3');
 
-        expect(mockExecFile).toHaveBeenCalledTimes(1);
-        expect(mockExecFile.mock.calls[0][0]).toBe('powershell.exe');
-        expect(mockExecFile.mock.calls[0][1]).toContain('-Command');
-        expect(mockExecFile.mock.calls[0][1].join(' ')).toContain('mciSendString');
+        expect(psScripts()).toHaveLength(1);
+        expect(lastPsScript()).toContain('System.Windows.Media.MediaPlayer');
+        expect(lastPsScript()).toContain('notify.mp3');
+        void unusedShell;
       }
     });
 
-    it('should dispatch to Windows MCI playback when os.platform() reports win32', async () => {
+    it('should dispatch to Windows playback when os.platform() reports win32', async () => {
       tts = createTTSForPlatform('win32');
 
       await tts.playAudioFile('notify.mp3', 2);
 
-      expect(mockShell.getCallCount()).toBe(1);
-      expect(mockShell.getLastCall().command).toContain('powershell.exe');
-      expect(mockShell.getLastCall().command).toContain('mciSendString');
-      expect(mockShell.getLastCall().command).toContain('-lt 2');
+      expect(psScripts()).toHaveLength(1);
+      expect(lastPsScript()).toContain('powershell.exe');
+      expect(lastPsScript()).toContain('System.Windows.Media.MediaPlayer');
+      expect(lastPsScript()).toContain('-lt 2');
+    });
+
+    it('should not use PowerShell playback backticks that break command parsing', async () => {
+      if (process.platform === 'win32') {
+        // The old MCI script embedded `"open \`"$filePath\`" alias $alias"`, which
+        // is what produced `The string is missing the terminator: ".`
+        tts = createTTSForPlatform('win32');
+        scriptRunner({ exitCode: 1 });
+        await tts.playAudioFile('notify.mp3');
+        const mci = psScripts().find((s) => s.includes('mciSendString')) ?? '';
+        expect(mci).toContain(`'open "' + $filePath + '" alias ' + $alias`);
+        expect(mci).not.toContain('`"');
+        scriptRunner({ exitCode: 0 });
+      }
+    });
+
+    it('should honour a restricted windowsAudioBackends configuration', async () => {
+      if (process.platform === 'win32') {
+        createTestConfig({ windowsAudioBackends: ['shell'] });
+        tts = createTTS({ $: mockShell, client: createMockClient() });
+
+        await tts.playAudioFile('notify.mp3');
+
+        expect(psScripts()).toHaveLength(1);
+        expect(lastPsScript()).toContain('Start-Process');
+      }
     });
 
     it('should dispatch to afplay when os.platform() reports darwin', async () => {
@@ -246,18 +313,15 @@ describe('tts.js', () => {
 
     it('should return false if no endpoint is configured', async () => {
       createTestConfig({ openaiTtsEndpoint: '' });
-      tts = createTTS({ $: mockShell, client: mockClient });
-      
-      // Mock edge to fail so we don't get true from fallback
+
+      // Mock edge and SAPI to fail so we don't get true from a fallback.
       mockEdgeTTSToFile.mockImplementation(() => Promise.reject(new Error('Edge failed')));
-      // Mock sapi to fail as well
-      mockShell = createMockShellRunner({
-        handler: () => ({ exitCode: 1, stderr: 'SAPI failed' })
-      });
+      scriptRunner({ exitCode: 1, stderr: 'SAPI failed' });
       tts = createTTS({ $: mockShell, client: mockClient });
 
       const success = await tts.speak('Hello', { ttsEngine: 'openai' });
       expect(success).toBe(false);
+      scriptRunner({ exitCode: 0, stderr: '' });
     });
 
     it('should make a POST request to the correct endpoint', async () => {
@@ -319,16 +383,15 @@ describe('tts.js', () => {
         text: () => Promise.resolve('Error')
       }));
       
-      // Mock edge and sapi to fail so we don't get true from fallback
+      // Mock edge and SAPI to fail so we don't get true from a fallback.
       mockEdgeTTSToFile.mockImplementation(() => Promise.reject(new Error('Edge failed')));
-      // On win32, sapi will be tried. It will fail if powershell fails or is mocked to fail.
-      mockShell = createMockShellRunner({
-        handler: () => ({ exitCode: 1, stderr: 'SAPI failed' })
-      });
+      // On win32, SAPI is tried next; it fails when the PowerShell script does.
+      scriptRunner({ exitCode: 1, stderr: 'SAPI failed' });
       tts = createTTS({ $: mockShell, client: mockClient });
 
       const success = await tts.speak('Hello');
       expect(success).toBe(false);
+      scriptRunner({ exitCode: 0, stderr: '' });
     });
   });
 
@@ -412,58 +475,46 @@ describe('tts.js', () => {
     let mockShell;
     let tts;
 
+    const sentWakeKeys = () => psScripts().filter((s) => s.includes('SendWait'));
+
     beforeEach(() => {
       createTestTempDir();
       mockShell = createMockShellRunner();
       tts = createTTS({ $: mockShell, client: createMockClient() });
+      // Idle seconds are read back from the idle-probe script's stdout.
+      scriptRunner({ exitCode: 0, stdout: '60' });
     });
 
     afterEach(() => {
       cleanupTestTempDir();
+      scriptRunner({ stdout: '' });
     });
 
     it('should skip wake if idle time is below threshold', async () => {
       if (process.platform === 'win32') {
-        mockShell = createMockShellRunner({
-          handler: (cmd) => {
-            if (cmd.includes('IdleCheck')) return { stdout: Buffer.from('10') };
-            return { exitCode: 0 };
-          }
-        });
-        tts = createTTS({ $: mockShell, client: createMockClient() });
+        scriptRunner({ stdout: '10' });
 
         await tts.wakeMonitor();
-        expect(mockShell.wasCalledWith('SendWait')).toBe(false);
+        expect(sentWakeKeys()).toHaveLength(0);
       }
     });
 
     it('should wake if idle time is above threshold', async () => {
       if (process.platform === 'win32') {
-        mockShell = createMockShellRunner({
-          handler: (cmd) => {
-            if (cmd.includes('IdleCheck')) return { stdout: Buffer.from('60') };
-            return { exitCode: 0 };
-          }
-        });
-        tts = createTTS({ $: mockShell, client: createMockClient() });
+        scriptRunner({ stdout: '60' });
 
         await tts.wakeMonitor();
-        expect(mockShell.wasCalledWith('SendWait')).toBe(true);
+        expect(sentWakeKeys()).toHaveLength(1);
+        expect(sentWakeKeys()[0]).toContain('SendWait');
       }
     });
 
     it('should force wake if force parameter is true', async () => {
       if (process.platform === 'win32') {
-        mockShell = createMockShellRunner({
-          handler: (cmd) => {
-            if (cmd.includes('IdleCheck')) return { stdout: Buffer.from('10') };
-            return { exitCode: 0 };
-          }
-        });
-        tts = createTTS({ $: mockShell, client: createMockClient() });
+        scriptRunner({ stdout: '10' });
 
         await tts.wakeMonitor(true);
-        expect(mockShell.wasCalledWith('SendWait')).toBe(true);
+        expect(sentWakeKeys()).toHaveLength(1);
       }
     });
   });
@@ -487,32 +538,24 @@ describe('tts.js', () => {
     it('should skip if volume is above threshold', async () => {
       if (process.platform === 'win32') {
         createTestConfig(createMinimalConfig({ forceVolume: true, volumeThreshold: 50 }));
-        mockShell = createMockShellRunner({
-          handler: (cmd) => {
-            if (cmd.includes('Win32VolCheck')) return { stdout: Buffer.from('80') };
-            return { exitCode: 0 };
-          }
-        });
+        scriptRunner({ stdout: '80' });
         tts = createTTS({ $: mockShell, client: createMockClient() });
 
         await tts.forceVolume();
-        expect(mockShell.wasCalledWith('SendKeys([char]175)')).toBe(false);
+        expect(psScripts().some((s) => s.includes('SendKeys([char]175)'))).toBe(false);
+        scriptRunner({ stdout: '' });
       }
     });
 
     it('should force volume if below threshold', async () => {
       if (process.platform === 'win32') {
         createTestConfig(createMinimalConfig({ forceVolume: true, volumeThreshold: 50 }));
-        mockShell = createMockShellRunner({
-          handler: (cmd) => {
-            if (cmd.includes('Win32VolCheck')) return { stdout: Buffer.from('20') };
-            return { exitCode: 0 };
-          }
-        });
+        scriptRunner({ stdout: '20' });
         tts = createTTS({ $: mockShell, client: createMockClient() });
 
         await tts.forceVolume();
-        expect(mockShell.wasCalledWith('SendKeys([char]175)')).toBe(true);
+        expect(psScripts().some((s) => s.includes('SendKeys([char]175)'))).toBe(true);
+        scriptRunner({ stdout: '' });
       }
     });
   });
@@ -534,11 +577,11 @@ describe('tts.js', () => {
     it('should generate and execute PowerShell script on win32', async () => {
       if (process.platform === 'win32') {
         await tts.speak('Hello', { ttsEngine: 'sapi' });
-        
-        expect(mockShell.wasCalledWith('powershell.exe')).toBe(true);
-        expect(mockShell.getLastCall().command).toContain('-File');
-        // The script path is in os.tmpdir(), but we can't easily check contents here
-        // unless we mock fs.writeFileSync which might be too much.
+
+        // The script is handed straight to powershell.exe as a single -Command
+        // argument; it used to be written to a .ps1 and passed through the `$`
+        // shell runner, where the path quoting was mangled.
+        expect(psScripts().some((s) => s.includes('System.Speech') && s.includes('SpeakSsml'))).toBe(true);
       }
     });
   });
@@ -563,20 +606,21 @@ describe('tts.js', () => {
       if (process.platform === 'win32') {
         // Create config with forceVolume and wakeMonitor enabled
         createTestConfig(createMinimalConfig({ forceVolume: true, volumeThreshold: 50, wakeMonitor: true, idleThresholdSeconds: 60 }));
-        // Mock to trigger wake and force volume
-        mockShell = createMockShellRunner({
-          handler: (cmd) => {
-            if (cmd.includes('IdleCheck')) return { stdout: Buffer.from('60') };
-            if (cmd.includes('Win32VolCheck')) return { stdout: Buffer.from('20') };
-            return { exitCode: 0 };
-          }
+        // The idle probe and the volume probe share one PowerShell runner and
+        // need different answers: idle 60s (>= threshold) and volume 20 (< 50).
+        scriptRunner({
+          respond: [
+            { match: 'IdleCheck', stdout: '60' },
+            { match: 'Win32VolCheck', stdout: '20' },
+          ],
         });
         tts = createTTS({ $: mockShell, client: createMockClient() });
-        
+
         await tts.announce('Hello');
-        
-        expect(mockShell.wasCalledWith('SendWait')).toBe(true);
-        expect(mockShell.wasCalledWith('SendKeys([char]175)')).toBe(true);
+
+        expect(psScripts().some((s) => s.includes('SendWait'))).toBe(true);
+        expect(psScripts().some((s) => s.includes('SendKeys([char]175)'))).toBe(true);
+        scriptRunner({ stdout: '', respond: [] });
       }
     });
   });

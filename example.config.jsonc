@@ -385,6 +385,33 @@
     "enableToast": true,
     "enableSound": true,
 
+    // ------------------------------------------------------------
+    // WINDOWS AUDIO BACKENDS
+    // ------------------------------------------------------------
+    // Ordered list of audio backends tried until one succeeds. Remove one to
+    // skip it, or reorder to change the preference.
+    //
+    //   dotnet      - WPF MediaPlayer. Silent and in-process, but needs the
+    //                 Windows audio codecs (Media Foundation). Fails on
+    //                 Server Core, N-editions and some VM images.
+    //   mci         - Legacy Windows Media Control Interface. Same codec
+    //                 requirement; fails with MCI error 277 on such machines.
+    //   ffplay      - FFmpeg's player, which bundles its own decoders. This is
+    //                 the backend that works on a codec-less Windows install;
+    //                 it is used only when ffplay is on PATH.
+    //   soundplayer - System.Media.SoundPlayer. Always available, but only
+    //                 plays uncompressed .wav (used for SAPI output).
+    //   shell       - Opens the file in your default media player. The last
+    //                 resort; works as long as any player is installed.
+    //
+    // Backends that fail are skipped for the rest of the session, so a missing
+    // codec costs one slow attempt rather than one per notification.
+    //
+    // Examples:
+    //   "windowsAudioBackends": ["ffplay"],              // FFmpeg only
+    //   "windowsAudioBackends": ["dotnet", "mci"],       // never launch anything
+    "windowsAudioBackends": ["dotnet", "mci", "ffplay", "soundplayer", "shell"],
+
     // ============================================================
     // DESKTOP NOTIFICATION SETTINGS
     // ============================================================

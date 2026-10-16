@@ -295,6 +295,7 @@ export const getDefaultConfigObject = (): PluginConfig => ({
   volumeThreshold: 50,
   enableToast: true,
   enableSound: true,
+  windowsAudioBackends: ['dotnet', 'mci', 'ffplay', 'soundplayer', 'shell'],
   enableDesktopNotification: true,
   desktopNotificationTimeout: 5,
   showProjectInNotification: true,

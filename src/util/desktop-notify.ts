@@ -225,9 +225,14 @@ export const sendDesktopNotification = async (
         resolve(result);
       };
 
+      // Some node-notifier backends invoke the callback seconds after the toast was
+      // actually posted (Windows SnoreToast on a codec-less machine takes ~4s).
+      // This is a short safety net so a never-firing callback cannot leak the
+      // promise, not a measure of delivery — callers fire and forget, so keep the
+      // budget small and word the log so it is not mistaken for a send failure.
       const callbackTimeoutMs = Math.min(1200, Math.max(200, (Number(opts.timeout ?? 5) || 5) * 1000 + 250));
       const safetyTimeout = setTimeout(() => {
-        debugLog(`Notification callback timeout after ${callbackTimeoutMs}ms`, debug);
+        debugLog(`Notification callback still pending after ${callbackTimeoutMs}ms (toast already dispatched)`, debug);
         settle({ success: false, error: 'Notification callback timeout' });
       }, callbackTimeoutMs);
 

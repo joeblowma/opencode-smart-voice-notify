@@ -12,6 +12,7 @@ import {
   createMockShellRunner,
   createMockClient,
   mockEvents,
+  trackPlugin,
   wait,
   getTestTempDir,
   testFileExists,
@@ -40,11 +41,11 @@ describe('Plugin E2E (Config Integration)', () => {
   describe('enabled: false', () => {
     test('should completely disable plugin when enabled is false', async () => {
       createTestConfig(createMinimalConfig({ enabled: false }));
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       expect(plugin).toEqual({});
       
@@ -64,11 +65,11 @@ describe('Plugin E2E (Config Integration)', () => {
         enableTTSReminder: true // Should also be ignored
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       await plugin.event({ event: mockEvents.sessionIdle('s1') });
       
@@ -99,11 +100,11 @@ describe('Plugin E2E (Config Integration)', () => {
         idleSound: 'assets/test-sound.mp3'
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       await plugin.event({ event: mockEvents.sessionIdle('s1') });
       
@@ -127,11 +128,11 @@ describe('Plugin E2E (Config Integration)', () => {
         permissionSound: 'assets/test-sound.mp3'
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       const startTime = Date.now();
       await plugin.event({ event: mockEvents.permissionAsked('p1', 's1') });
@@ -162,11 +163,11 @@ describe('Plugin E2E (Config Integration)', () => {
         ttsEngine: 'edge' // Use Edge TTS which works cross-platform
       }));
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       await plugin.event({ event: mockEvents.sessionIdle('s1') });
       
@@ -187,11 +188,11 @@ describe('Plugin E2E (Config Integration)', () => {
     test('should handle missing config file by creating defaults', async () => {
       // Don't call createTestConfig() - leave directory empty
       
-      const plugin = await SmartVoiceNotifyPlugin({
+      const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
         project: { name: 'TestProject' },
         client: mockClient,
         $: mockShell
-      });
+      }));
       
       // Verify plugin initialized (default is enabled: true)
       expect(plugin.event).toBeDefined();

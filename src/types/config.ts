@@ -137,6 +137,17 @@ export interface PluginConfig {
   enableToast: boolean;
   enableSound: boolean;
 
+  /**
+   * Ordered Windows audio backends tried until one succeeds.
+   *
+   * Defaults to every backend, fastest/most-integrated first:
+   * `dotnet` (WPF MediaPlayer) -> `mci` -> `ffplay` -> `soundplayer` -> `shell`.
+   * Restrict this to force a specific player, e.g. `['ffplay']`.
+   * `shell` hands the file to the user's default media player, which works even
+   * when Windows has no audio codecs registered at all.
+   */
+  windowsAudioBackends?: string[];
+
   // Desktop notifications
   enableDesktopNotification: boolean;
   desktopNotificationTimeout: number;

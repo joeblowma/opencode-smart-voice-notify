@@ -1,5 +1,4 @@
 import crypto from 'crypto';
-import { execFile } from 'node:child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -11,6 +10,7 @@ import type { SpeakOptions, TTSAPI, TTSFactoryParams } from '../types/tts.js';
 
 import { loadConfig } from './config.js';
 import { createLinuxPlatform } from './linux.js';
+import { runPowerShellScript } from './powershell.js';
 
 const getPlatform = (): NodeJS.Platform => os.platform();
 // Remove module-level configDir constant that caches process.env prematurely
@@ -301,33 +301,30 @@ export const createTTS = ({ $, client }: TTSFactoryParams): TTSAPI => {
     } catch {}
   };
 
-  const execFileQuiet = (file: string, args: string[]): Promise<void> => {
-    return new Promise((resolve, reject) => {
-      execFile(file, args, { windowsHide: true }, (error, stdout, stderr) => {
-        const stderrText = outputToString(stderr).trim();
-        const stdoutText = outputToString(stdout).trim();
-
-        if (error) {
-          const details = [getErrorMessage(error), stderrText, stdoutText].filter(Boolean).join('; ');
-          reject(new Error(details || `${file} failed`));
-          return;
-        }
-
-        if (stderrText) {
-          debugLog(`execFileQuiet stderr from ${file}: ${stderrText}`);
-        }
-        resolve();
-      });
-    });
+  /**
+   * Run a PowerShell script and throw on failure.
+   *
+   * Scripts are handed straight to `powershell.exe` as a single `-Command`
+   * argument instead of being interpolated into a shell command string.  A
+   * shell round-trip mangles the embedded quotes, here-strings and newlines of
+   * these snippets, which produced
+   * `The string is missing the terminator: ".` and silently killed playback.
+   */
+  const runPowerShellCommand = async (cmd: string): Promise<void> => {
+    const result = await runPowerShellScript(cmd);
+    if (result.exitCode !== 0) {
+      const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.exitCode}`;
+      throw new Error(detail);
+    }
   };
 
-  const runPowerShellCommand = async (cmd: string): Promise<void> => {
-    if (shell) {
-      await shell`powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ${cmd}`.quiet();
-      return;
+  /** Run a PowerShell script and return stdout, ignoring failures. */
+  const runPowerShellProbe = async (cmd: string): Promise<string> => {
+    const result = await runPowerShellScript(cmd);
+    if (result.exitCode !== 0) {
+      debugLog(`PowerShell probe failed: ${result.stderr.trim() || `exit code ${result.exitCode}`}`);
     }
-
-    await execFileQuiet('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', cmd]);
+    return result.stdout.trim();
   };
 
   const escapePowerShellSingleQuotedString = (value: string): string => value.replace(/'/g, "''");
@@ -339,12 +336,99 @@ export const createTTS = ({ $, client }: TTSFactoryParams): TTSAPI => {
     return Math.max(1, Math.floor(value));
   };
 
-  /**
-   * Play an audio file using legacy Windows Media Center (MCI)
-   */
+  // ============================================================
+  // Windows audio backends
+  // ============================================================
+  //
+  // Windows has no single reliable way to play an arbitrary audio file:
+  //
+  //   * WPF `MediaPlayer` and MCI both sit on top of Media Foundation, so on a
+  //     machine without the audio codecs registered (Server Core, N-editions,
+  //     some VM images) they fail — `MediaPlayer.NaturalDuration` never resolves
+  //     and `mciSendString('open ...')` returns 277 / MCIERR_UNIMPL_SPECIFIED.
+  //     `mciSendString('list all devices')` returns nothing at all.
+  //   * `SoundPlayer` plays uncompressed WAV only.
+  //   * `ffplay` ships its own decoders, so it works on a codec-less box.
+  //   * Handing the file to the shell (the user's default media player) is the
+  //     last resort and works as long as *some* player is installed.
+  //
+  // So the plugin walks an ordered chain instead of hard-coding one backend.
+  // Each backend returns a PowerShell script, or `null` when it is unavailable
+  // (which is checked before spawning anything, so the chain stays cheap).
 
+  const findExecutableOnPath = (name: string): string | null => {
+    const extensions =
+      currentPlatform === 'win32'
+        ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)
+        : [''];
+    const directories = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+
+    for (const directory of directories) {
+      for (const extension of extensions) {
+        const candidate = path.join(directory.replace(/^"|"$/g, ''), `${name}${extension}`);
+        try {
+          if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+            return candidate;
+          }
+        } catch {
+          // Unreadable PATH entry — keep looking.
+        }
+      }
+    }
+    return null;
+  };
+
+  const executableCache = new Map<string, string | null>();
+  const findExecutableCached = (name: string): string | null => {
+    if (!executableCache.has(name)) {
+      executableCache.set(name, findExecutableOnPath(name));
+    }
+    return executableCache.get(name) ?? null;
+  };
+
+  /** WPF `MediaPlayer` — in-process and silent, but needs OS audio codecs. */
+  const getWindowsDotnetPlaybackCommand = (audioPath: string, loopCount: number): string => {
+    const safePath = escapePowerShellSingleQuotedString(audioPath);
+    // NaturalDuration never resolves when a codec is missing, which used to
+    // hang the `while` loop forever; it is now bounded by a short deadline
+    // (a local file opens in well under a second when it is going to work).
+    return `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName presentationCore
+$player = New-Object System.Windows.Media.MediaPlayer
+$filePath = (Resolve-Path '${safePath}').Path
+$player.Open($filePath)
+$deadline = (Get-Date).AddSeconds(5)
+while (-not $player.NaturalDuration.HasTimeSpan -and (Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 50
+}
+if (-not $player.NaturalDuration.HasTimeSpan) {
+    $player.Close()
+    throw 'MediaPlayer could not determine the duration of the file (no MP3/AAC codec registered?)'
+}
+$durationMs = [int][Math]::Ceiling($player.NaturalDuration.TimeSpan.TotalMilliseconds) + 200
+try {
+  $player.Play()
+  Start-Sleep -Milliseconds $durationMs
+
+  for ($i = 1; $i -lt ${loopCount}; $i++) {
+    $player.Position = [System.TimeSpan]::Zero
+    $player.Play()
+    Start-Sleep -Milliseconds $durationMs
+  }
+} finally {
+  try { $player.Close() } catch {}
+}
+exit 0
+`;
+  };
+
+  /** Legacy MCI — also codec-dependent, kept as a second in-process option. */
   const getWindowsMciPlaybackCommand = (audioPath: string, loopCount: number): string => {
     const safePath = escapePowerShellSingleQuotedString(audioPath);
+    // The MCI command string is assembled with '+' concatenation instead of
+    // PowerShell backtick-escaped quotes.  Backtick quoting is fragile and was
+    // the direct cause of the "missing terminator" parse failure.
     return `
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
@@ -366,47 +450,190 @@ $filePath = '${safePath}'
 $alias = 'opencode_notify_' + ([Guid]::NewGuid().ToString('N'))
 try {
   for ($i = 0; $i -lt ${loopCount}; $i++) {
-    [void](Invoke-Mci "open \`"$filePath\`" alias $alias")
-    [void](Invoke-Mci "play $alias wait")
-    [void](Invoke-Mci "close $alias")
+    [void](Invoke-Mci ('open "' + $filePath + '" alias ' + $alias))
+    [void](Invoke-Mci ('play ' + $alias + ' wait'))
+    [void](Invoke-Mci ('close ' + $alias))
   }
 } finally {
-  try { [void](Invoke-Mci "close $alias") } catch {}
+  try { [void](Invoke-Mci ('close ' + $alias)) } catch {}
 }
 exit 0
 `;
   };
 
-  /**
-   * Play an audio file using .NET player
-   */
-
-  const getWindowsDotnetPlaybackCommand = (audioPath: string, loopCount: number): string => {
+  /** `ffplay` — bundles its own decoders, so it works without OS codecs. */
+  const getWindowsFfplayPlaybackCommand = (audioPath: string, loopCount: number, ffplay: string): string => {
     const safePath = escapePowerShellSingleQuotedString(audioPath);
+    // `-stream_loop` is missing from some ffplay builds, so repeat the process
+    // instead of relying on it.
     return `
 $ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName presentationCore
-$player = New-Object System.Windows.Media.MediaPlayer
-$filePath = (Resolve-Path "${safePath}").Path
-$player.Open($filePath)
-while ($player.NaturalDuration.HasTimeSpan -eq $false) {
-    Start-Sleep -Milliseconds 50
-}
-$durationSeconds = $player.NaturalDuration.TimeSpan.TotalSeconds
-$player.Play()
-Start-Sleep -Seconds $durationSeconds
-
-try {
-  for ($i = 1; $i -lt ${loopCount}; $i++) {
-    $player.Position = [System.TimeSpan]::Zero
-    $player.Play()
-    Start-Sleep -Seconds $durationSeconds
-  }
-} finally {
-  try { $player.Close() } catch {}
+$player = '${escapePowerShellSingleQuotedString(ffplay)}'
+if (-not (Test-Path -LiteralPath $player)) { throw "ffplay not found at $player" }
+$filePath = '${safePath}'
+for ($i = 0; $i -lt ${loopCount}; $i++) {
+  & $player -nodisp -autoexit -loglevel quiet -loglevel error $filePath
+  if ($LASTEXITCODE -ne 0) { throw "ffplay exited with code $LASTEXITCODE" }
 }
 exit 0
 `;
+  };
+
+  /** `System.Media.SoundPlayer` — always available, but uncompressed WAV only. */
+  const getWindowsSoundPlayerPlaybackCommand = (audioPath: string, loopCount: number): string => {
+    const safePath = escapePowerShellSingleQuotedString(audioPath);
+    return `
+$ErrorActionPreference = 'Stop'
+$player = New-Object System.Media.SoundPlayer
+$player.Load('${safePath}')
+for ($i = 0; $i -lt ${loopCount}; $i++) {
+  $player.PlaySync()
+}
+$player.Dispose()
+exit 0
+`;
+  };
+
+  /**
+   * Hand the file to the shell so it opens in the user's default media player.
+   * Works even when Windows itself cannot decode the format.  It is
+   * fire-and-forget: there is no reliable way to know when the external player
+   * has finished, so `loopCount` is capped at a single launch.
+   */
+  const getWindowsShellPlaybackCommand = (audioPath: string): string => {
+    const safePath = escapePowerShellSingleQuotedString(audioPath);
+    return `
+$ErrorActionPreference = 'Stop'
+$filePath = (Resolve-Path '${safePath}').Path
+Start-Process -FilePath $filePath
+exit 0
+`;
+  };
+
+  type WindowsAudioBackend = 'dotnet' | 'mci' | 'ffplay' | 'soundplayer' | 'shell';
+
+  const DEFAULT_WINDOWS_BACKENDS: WindowsAudioBackend[] = ['dotnet', 'mci', 'ffplay', 'soundplayer', 'shell'];
+
+  const configuredWindowsBackends = (): WindowsAudioBackend[] => {
+    const configured = config.windowsAudioBackends;
+    if (!Array.isArray(configured) || configured.length === 0) {
+      return DEFAULT_WINDOWS_BACKENDS;
+    }
+    const known = new Set<string>(DEFAULT_WINDOWS_BACKENDS);
+    const filtered = configured
+      .map((entry) => String(entry).trim().toLowerCase())
+      .filter((entry): entry is WindowsAudioBackend => known.has(entry));
+    return filtered.length > 0 ? filtered : DEFAULT_WINDOWS_BACKENDS;
+  };
+
+  let ffplayPath: string | null | undefined;
+
+  /**
+   * Backends that recently failed are skipped for the rest of the process.
+   *
+   * A missing codec or a missing player does not fix itself between
+   * notifications, and probing WPF `MediaPlayer` for its duration costs ~5s on
+   * a codec-less machine — pure dead time before every single notification.
+   * A backend becomes eligible again after {@link BACKEND_QUARANTINE_MS} so a
+   * transient failure (a file that was still being written, say) heals.
+   */
+  const BACKEND_QUARANTINE_MS = 10 * 60_000;
+  const backendQuarantine = new Map<WindowsAudioBackend, number>();
+
+  const isBackendQuarantined = (backend: WindowsAudioBackend): boolean => {
+    const failedAt = backendQuarantine.get(backend);
+    if (failedAt === undefined) return false;
+    if (Date.now() - failedAt > BACKEND_QUARANTINE_MS) {
+      backendQuarantine.delete(backend);
+      return false;
+    }
+    return true;
+  };
+
+  const quarantineBackend = (backend: WindowsAudioBackend): void => {
+    backendQuarantine.set(backend, Date.now());
+  };
+
+  const clearBackendQuarantine = (backend: WindowsAudioBackend): void => {
+    backendQuarantine.delete(backend);
+  };
+
+  interface WindowsPlaybackPlan {
+    backend: WindowsAudioBackend;
+    script: string;
+  }
+
+  /**
+   * Build the ordered list of Windows playback attempts, skipping backends that
+   * are not usable at all (so nothing is spawned only to fail immediately).
+   */
+  const getWindowsPlaybackPlans = (audioPath: string, loopCount: number): WindowsPlaybackPlan[] => {
+    const plans: WindowsPlaybackPlan[] = [];
+    const isWav = path.extname(audioPath).toLowerCase() === '.wav';
+
+    for (const backend of configuredWindowsBackends()) {
+      switch (backend) {
+        case 'dotnet':
+          plans.push({ backend, script: getWindowsDotnetPlaybackCommand(audioPath, loopCount) });
+          break;
+        case 'mci':
+          plans.push({ backend, script: getWindowsMciPlaybackCommand(audioPath, loopCount) });
+          break;
+        case 'ffplay':
+          if (ffplayPath === undefined) {
+            ffplayPath = findExecutableCached('ffplay');
+            debugLog(`playAudioFile: ffplay lookup -> ${ffplayPath ?? 'not found on PATH'}`);
+          }
+          if (ffplayPath) {
+            plans.push({ backend, script: getWindowsFfplayPlaybackCommand(audioPath, loopCount, ffplayPath) });
+          }
+          break;
+        case 'soundplayer':
+          // SoundPlayer silently does nothing useful for compressed formats.
+          if (isWav) {
+            plans.push({ backend, script: getWindowsSoundPlayerPlaybackCommand(audioPath, loopCount) });
+          }
+          break;
+        case 'shell':
+          plans.push({ backend, script: getWindowsShellPlaybackCommand(audioPath) });
+          break;
+        default:
+          break;
+      }
+    }
+
+    return plans;
+  };
+
+  const playWindowsAudio = async (filePath: string, loopCount: number): Promise<void> => {
+    const plans = getWindowsPlaybackPlans(filePath, loopCount);
+    if (plans.length === 0) {
+      throw new Error('no usable Windows audio backend is configured');
+    }
+
+    const failures: string[] = [];
+    for (const plan of plans) {
+      if (isBackendQuarantined(plan.backend)) {
+        debugLog(`playAudioFile: skipping backend "${plan.backend}" (recently failed)`);
+        failures.push(`${plan.backend}: skipped after an earlier failure`);
+        continue;
+      }
+
+      debugLog(`playAudioFile: trying backend "${plan.backend}" for ${filePath} (${loopCount}x)`);
+      try {
+        await runPowerShellCommand(plan.script);
+        clearBackendQuarantine(plan.backend);
+        debugLog(`playAudioFile: Windows playback succeeded via "${plan.backend}" for ${filePath} (${loopCount}x)`);
+        return;
+      } catch (error) {
+        const detail = (getErrorMessage(error).split('\n')[0] ?? '').trim();
+        failures.push(`${plan.backend}: ${detail}`);
+        quarantineBackend(plan.backend);
+        debugLog(`playAudioFile: backend "${plan.backend}" failed — ${detail}`);
+      }
+    }
+
+    throw new Error(failures.join(' | '));
   };
 
   /**
@@ -416,18 +643,11 @@ exit 0
     const safeLoops = getSafeLoopCount(loops);
     try {
       if (currentPlatform === 'win32') {
-        try {
-          debugLog('playAudioFile: attempting to playAudioFile via .NET');
-          const cmd = getWindowsDotnetPlaybackCommand(filePath, safeLoops);
-          await runPowerShellCommand(cmd);
-          debugLog(`playAudioFile: Windows .NET playback completed for ${filePath} (${safeLoops}x)`);
-        } catch (error) {
-          debugLog(`playAudioFile error: .NET failed ${getErrorMessage(error)} attempting MCI`);
-          const cmd = getWindowsMciPlaybackCommand(filePath, safeLoops);
-          await runPowerShellCommand(cmd);
-          debugLog(`playAudioFile: Windows MCI playback completed for ${filePath} (${safeLoops}x)`);
-        }
-      } else if (currentPlatform === 'darwin') {
+        await playWindowsAudio(filePath, safeLoops);
+        return;
+      }
+
+      if (currentPlatform === 'darwin') {
         if (!shell) {
           debugLog('playAudioFile: shell runner ($) not available for macOS playback');
           return;
@@ -725,14 +945,13 @@ exit 0
 
     const tempFile = cacheFile ? `${cacheFile}.${process.pid}.${Date.now()}.tmp` : createTempAudioFile('opencode-edge-tts', 'mp3');
 
-    // Escape text for shell (replace quotes with escaped quotes)
-    const escapedText = text.replace(/"/g, '\\"');
-
     // Try Python edge-tts first (more reliable due to aiohttp WebSocket handling)
     if (shell) {
       try {
-        // Use proper template literal syntax with individual arguments
-        await shell`edge-tts --voice ${voice} --rate ${rate} --volume ${volume} --pitch ${pitch} --text ${escapedText} --write-media ${tempFile}`
+        // The shell runner quotes interpolated values for us; pre-escaping the
+        // text here would corrupt it (it turned "done" into \"done\" and made
+        // the CLI write no file at all).
+        const result = await shell`edge-tts --voice ${voice} --rate ${rate} --volume ${volume} --pitch ${pitch} --text ${text} --write-media ${tempFile}`
           .quiet()
           .nothrow();
 
@@ -748,6 +967,13 @@ exit 0
           debugLog('speakWithEdgeTTS: success via Python edge-tts CLI');
           return true;
         }
+
+        // No output file — surface why, instead of silently falling through to
+        // the npm package (this used to look like an unexplained WebSocket
+        // failure several lines later).
+        debugLog(
+          `speakWithEdgeTTS: Python CLI produced no audio (exit=${result.exitCode}, stderr=${outputToString(result.stderr).trim().slice(0, 300) || 'empty'}), trying npm package...`,
+        );
       } catch (error) {
         debugLog(`speakWithEdgeTTS: Python CLI failed: ${getErrorMessage(error) || 'unknown'}, trying npm package...`);
         // Fall through to try npm package
@@ -757,11 +983,31 @@ exit 0
     // Fallback to msedge-tts npm package
     try {
       const { MsEdgeTTS, OUTPUT_FORMAT } = await import('msedge-tts');
-      const tts = new MsEdgeTTS();
 
-      await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+      // The Edge WebSocket handshake fails intermittently ("Expected 101 status
+      // code") under load or right after a burst of other requests.  One short
+      // retry turns most of those into a success instead of a silent fallthrough
+      // to the offline engines.
+      const synthesizeWithMsEdgeTts = async (): Promise<string> => {
+        let lastError: unknown;
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const tts = new MsEdgeTTS();
+          try {
+            await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+            const { audioFilePath } = await tts.toFile(os.tmpdir(), text, { pitch, rate, volume });
+            return audioFilePath;
+          } catch (error) {
+            lastError = error;
+            if (attempt === 1) {
+              debugLog(`speakWithEdgeTTS: msedge-tts attempt 1 failed (${getErrorMessage(error) || 'unknown'}), retrying…`);
+              await new Promise((resolve) => setTimeout(resolve, 500));
+            }
+          }
+        }
+        throw lastError;
+      };
 
-      const { audioFilePath } = await tts.toFile(os.tmpdir(), text, { pitch, rate, volume });
+      const audioFilePath = await synthesizeWithMsEdgeTts();
 
       const cacheWritten = cacheFile ? copyVoiceCacheFile(cacheFile, audioFilePath) : false;
       const audioFile = cacheWritten && cacheFile ? cacheFile : audioFilePath;
@@ -789,11 +1035,6 @@ exit 0
       debugLog('speakWithSAPI: skipped (not Windows)');
       return false;
     }
-    if (!shell) {
-      debugLog('speakWithSAPI: skipped (shell helper $ not available)');
-      return false;
-    }
-    const scriptPath = path.join(os.tmpdir(), `opencode-sapi-${Date.now()}.ps1`);
     let sapiOutputFile: string | null = null;
     try {
       const escapedText = text
@@ -813,10 +1054,16 @@ exit 0
         return true;
       }
 
-      sapiOutputFile = cacheFile ? `${cacheFile}.${process.pid}.${Date.now()}.tmp.wav` : null;
-      const setOutputToCacheFile = sapiOutputFile
-        ? `$synth.SetOutputToWaveFile('${sapiOutputFile.replace(/'/g, "''")}')`
-        : '';
+      // Always render to a WAV file rather than letting SAPI talk to the default
+      // audio device.  Desktop voices route through the audio stack, so on a
+      // machine with no default output (or no audio codecs) SAPI fails with
+      // "Audio device error encountered - Error Code: 0x2" and says nothing at
+      // all.  Rendering to a file and handing it to playAudioFile keeps SAPI a
+      // pure synthesizer and lets the Windows backend chain decide playback.
+      sapiOutputFile = cacheFile
+        ? `${cacheFile}.${process.pid}.${Date.now()}.tmp.wav`
+        : createTempAudioFile('opencode-sapi', 'wav');
+      const setOutputToWaveFile = `$synth.SetOutputToWaveFile('${sapiOutputFile.replace(/'/g, "''")}')`;
 
       const ssml = `<?xml version="1.0" encoding="UTF-8"?>
 <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">
@@ -833,7 +1080,7 @@ $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
 try {
     $synth.Rate = ${rate}
     try { $synth.SelectVoice("${voice.replace(/"/g, '""')}") } catch { }
-    ${setOutputToCacheFile}
+    ${setOutputToWaveFile}
     $ssml = @"
 ${ssml}
 "@
@@ -845,31 +1092,33 @@ ${ssml}
     if ($synth) { $synth.Dispose() }
 }
 `;
-      fs.writeFileSync(scriptPath, scriptContent, 'utf-8');
-      const result = await shell`powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${scriptPath}`.nothrow().quiet();
+      // The script is executed via runPowerShellScript rather than being written
+      // to disk and passed as `-File <path>`: the path used to be interpolated
+      // into a shell command string, where the quoting mangled it.
+      const result = await runPowerShellScript(scriptContent);
 
       if (result.exitCode !== 0) {
-        debugLog(`speakWithSAPI failed with code ${result.exitCode}: ${outputToString(result.stderr)}`);
+        debugLog(`speakWithSAPI failed with code ${result.exitCode}: ${result.stderr.trim() || result.stdout.trim()}`);
         return false;
       }
 
-      if (cacheFile && sapiOutputFile) {
-        if (commitVoiceCacheFile(sapiOutputFile, cacheFile)) {
-          await playAudioFile(cacheFile);
-          return true;
-        }
-        debugLog('speakWithSAPI: cache output file was not created');
+      if (!fs.existsSync(sapiOutputFile)) {
+        debugLog('speakWithSAPI: SAPI reported success but wrote no wave file');
         return false;
       }
 
+      // Promote the temp render into the cache when caching is enabled, then
+      // play whichever file won.
+      let audioFile = sapiOutputFile;
+      if (cacheFile && commitVoiceCacheFile(sapiOutputFile, cacheFile)) {
+        audioFile = cacheFile;
+      }
+      await playAudioFile(audioFile);
       return true;
     } catch (error) {
       debugLog(`speakWithSAPI error: ${getErrorMessage(error) || String(error) || 'Unknown error'}`);
       return false;
     } finally {
-      try {
-        if (fs.existsSync(scriptPath)) fs.unlinkSync(scriptPath);
-      } catch {}
       try {
         if (sapiOutputFile && fs.existsSync(sapiOutputFile)) fs.unlinkSync(sapiOutputFile);
       } catch {}
@@ -1000,8 +1249,7 @@ public static class IdleCheck {
 '@
 [IdleCheck]::GetIdleSeconds()
       `;
-      const result = await shell`powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ${cmd}`.quiet();
-      return parseInt(outputToString(result.stdout).trim() || '0', 10);
+      return parseInt(await runPowerShellProbe(cmd) || '0', 10);
     } catch {
       return 999; // Assume idle on error
     }
@@ -1030,8 +1278,7 @@ public static extern int waveOutGetVolume(IntPtr hwo, out uint dwVolume);
             [Math]::Round(($leftVol / 65535) * 100)
         } else { -1 }
       `;
-      const result = await shell`powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ${cmd}`.quiet();
-      return parseInt(outputToString(result.stdout).trim() || '-1', 10);
+      return parseInt(await runPowerShellProbe(cmd) || '-1', 10);
     } catch {
       return -1;
     }
@@ -1041,7 +1288,7 @@ public static extern int waveOutGetVolume(IntPtr hwo, out uint dwVolume);
    * Wake Monitor Utility
    */
   const wakeMonitor = async (force = false): Promise<void> => {
-    if (!config.wakeMonitor || !shell) return;
+    if (!config.wakeMonitor) return;
     try {
       const idleSeconds = await getSystemIdleSeconds();
       const threshold = config.idleThresholdSeconds || 30;
@@ -1055,9 +1302,9 @@ public static extern int waveOutGetVolume(IntPtr hwo, out uint dwVolume);
 
       if (currentPlatform === 'win32') {
         const cmd = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('{F15}')`;
-        await shell`powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ${cmd}`.quiet();
+        await runPowerShellCommand(cmd);
         debugLog('wakeMonitor: Windows wake command executed');
-      } else if (currentPlatform === 'darwin') {
+      } else if (currentPlatform === 'darwin' && shell) {
         await shell`caffeinate -u -t 1`.quiet();
         debugLog('wakeMonitor: macOS wake command executed');
       } else if (currentPlatform === 'linux' && linux) {
@@ -1074,7 +1321,12 @@ public static extern int waveOutGetVolume(IntPtr hwo, out uint dwVolume);
    * Force Volume Utility
    */
   const forceVolume = async (force = false): Promise<void> => {
-    if (!config.forceVolume || !shell) return;
+    if (!config.forceVolume) return;
+    if (currentPlatform === 'win32') {
+      // handled entirely through PowerShell below
+    } else if (!shell) {
+      return;
+    }
     try {
       if (!force) {
         const currentVolume = await getCurrentVolume();
@@ -1084,8 +1336,8 @@ public static extern int waveOutGetVolume(IntPtr hwo, out uint dwVolume);
 
       if (currentPlatform === 'win32') {
         const cmd = `$wsh = New-Object -ComObject WScript.Shell; 1..50 | ForEach-Object { $wsh.SendKeys([char]175) }`;
-        await shell`powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ${cmd}`.quiet();
-      } else if (currentPlatform === 'darwin') {
+        await runPowerShellCommand(cmd);
+      } else if (currentPlatform === 'darwin' && shell) {
         await shell`osascript -e "set volume output volume 100"`.quiet();
       } else if (currentPlatform === 'linux' && linux) {
         // Use the Linux platform module for force volume

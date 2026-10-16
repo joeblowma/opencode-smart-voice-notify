@@ -1,4 +1,4 @@
-import { test, expect, describe } from 'bun:test';
+import { test, expect, describe, afterAll } from 'bun:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -116,18 +116,59 @@ describe('V2 event translation', () => {
 });
 
 describe('V2 shell runner shim', () => {
+  // The shim has to behave on Windows too.  `printf`/`sleep` either do not exist
+  // there or treat single quotes literally, so use a tiny Node script that echoes
+  // its first argument: that asserts argument fidelity, which is the thing the
+  // shim actually gets wrong.
+  const echoScript = path.join(os.tmpdir(), `svn-shell-echo-${process.pid}.cjs`);
+  fs.writeFileSync(echoScript, 'process.stdout.write(process.argv[2] ?? "MISSING")');
+
+  afterAll(() => {
+    try {
+      fs.unlinkSync(echoScript);
+    } catch {
+      // best effort
+    }
+  });
+
+  const echo = ($: ReturnType<typeof createShellRunner>, value: string) => $`node ${echoScript} ${value}`;
+
   test('runs a simple command and captures stdout', async () => {
     const $ = createShellRunner();
-    const result = await $`printf 'hello'`.quiet().nothrow();
+    const result = await echo($, 'hello').quiet().nothrow();
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString()).toBe('hello');
   });
 
   test('interpolated values are passed as a single argument', async () => {
     const $ = createShellRunner();
-    const value = 'a b c';
-    const result = await $`printf '%s' ${value}`.quiet().nothrow();
+    const result = await echo($, 'a b c').quiet().nothrow();
+    expect(result.exitCode).toBe(0);
     expect(result.stdout.toString()).toBe('a b c');
+  });
+
+  test('interpolated values containing shell metacharacters survive intact', async () => {
+    const $ = createShellRunner();
+    // These are exactly the characters `cmd.exe` eats.  The previous Windows
+    // escaper emitted a literal backslash before every value, so `where sleep`
+    // became `where \"sleep\"` and searched for a file named `"sleep"`; and
+    // routing through `cmd /d /s /c` mangled quoted arguments wholesale.
+    const values = [
+      'say "hi" now',
+      "it's done",
+      'a & b',
+      '100% ready',
+      'back\\slash',
+      'caret ^ here',
+      'semi; colon',
+      'pipe|x',
+      'redirect>out',
+      'tick`x`',
+    ];
+    for (const value of values) {
+      const result = await echo($, value).quiet().nothrow();
+      expect(result.stdout.toString()).toBe(value);
+    }
   });
 
   test('nothrow resolves with non-zero exit code instead of rejecting', async () => {
@@ -147,11 +188,21 @@ describe('V2 shell runner shim', () => {
     expect(threw).toBe(true);
   });
 
+  test('shell builtins still go through a real shell', async () => {
+    const $ = createShellRunner();
+    // `exit` has no executable on disk, so the shim must not try to spawn it.
+    expect((await $`exit 0`.quiet().nothrow()).exitCode).toBe(0);
+  });
+
   test('timeout() is chainable and kills a long-running command', async () => {
     const $ = createShellRunner();
-    const result = await $`sleep 10`.quiet().nothrow().timeout!(150);
+    const started = Date.now();
+    // `child.kill()` alone leaves the grandchild holding stdout open on Windows,
+    // so the shim escalates to `taskkill /t /f` and force-settles with 124.
+    const result = await $`node -e "setTimeout(() => {}, 30000)"`.quiet().nothrow().timeout!(300);
     expect(result.exitCode).toBe(124);
-  });
+    expect(Date.now() - started).toBeLessThan(10_000);
+  }, 15_000);
 });
 
 describe('V2 client shim', () => {

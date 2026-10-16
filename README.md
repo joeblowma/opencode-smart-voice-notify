@@ -196,6 +196,9 @@ If you prefer to create the config manually, add a `smart-voice-notify.jsonc` fi
     "volumeThreshold": 50,
     "enableToast": true,
     "enableSound": true,
+    // Windows only: ordered audio backends tried until one works.
+    // See example.config.jsonc for details on each backend.
+    "windowsAudioBackends": ["dotnet", "mci", "ffplay", "soundplayer", "shell"],
     "debugLog": false
 }
 ```
@@ -561,6 +564,7 @@ When a user asks you to set up this plugin, follow these steps:
 | Issue | Solution |
 |-------|----------|
 | No sound playing | Check `"enableSound": true` and verify audio files exist in `~/.config/opencode/assets/` |
+| Windows: `MediaPlayer could not determine the duration` or `MCI command failed (277)` | Windows has no audio codecs registered. Install FFmpeg and put `ffplay` on `PATH`, or force a backend with `"windowsAudioBackends": ["ffplay"]`. `"shell"` also works — it opens the file in your default media player. |
 | TTS not working | Try fallback: change `"ttsEngine"` to `"edge"` (free, no API key) |
 | ElevenLabs quota exceeded | Plugin auto-falls back to Edge TTS; or set `"ttsEngine": "edge"` |
 | Notifications too frequent | Increase `"ttsReminderDelaySeconds"` (default: 30) |

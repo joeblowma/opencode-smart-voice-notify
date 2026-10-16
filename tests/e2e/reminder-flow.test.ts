@@ -10,6 +10,7 @@ import {
   createMockShellRunner,
   createMockClient,
   mockEvents,
+  trackPlugin,
   wait,
   waitFor,
   getTTSCalls
@@ -42,11 +43,11 @@ describe('Plugin E2E (Reminder Flow)', () => {
       ttsEngine: 'edge' // Use Edge TTS for cross-platform compatibility
     }));
     
-    const plugin = await SmartVoiceNotifyPlugin({
+    const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
       project: { name: 'TestProject' },
       client: mockClient,
       $: mockShell
-    });
+    }));
     
     await plugin.event({ event: mockEvents.sessionIdle('s1') });
     
@@ -72,11 +73,11 @@ describe('Plugin E2E (Reminder Flow)', () => {
       ttsEngine: 'edge' // Use Edge TTS for cross-platform compatibility
     }));
     
-    const plugin = await SmartVoiceNotifyPlugin({
+    const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
       project: { name: 'TestProject' },
       client: mockClient,
       $: mockShell
-    });
+    }));
     
     await plugin.event({ event: mockEvents.sessionIdle('s1') });
     
@@ -104,11 +105,11 @@ describe('Plugin E2E (Reminder Flow)', () => {
       ttsEngine: 'edge' // Use Edge TTS for cross-platform compatibility
     }));
     
-    const plugin = await SmartVoiceNotifyPlugin({
+    const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
       project: { name: 'TestProject' },
       client: mockClient,
       $: mockShell
-    });
+    }));
     
     await plugin.event({ event: mockEvents.sessionIdle('s1') });
     
@@ -137,11 +138,11 @@ describe('Plugin E2E (Reminder Flow)', () => {
       ttsEngine: 'edge' // Use Edge TTS for cross-platform compatibility
     }));
     
-    const plugin = await SmartVoiceNotifyPlugin({
+    const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
       project: { name: 'TestProject' },
       client: mockClient,
       $: mockShell
-    });
+    }));
     
     await plugin.event({ event: mockEvents.sessionIdle('s1') });
     
@@ -174,11 +175,11 @@ describe('Plugin E2E (Reminder Flow)', () => {
       ttsEngine: 'edge' // Use Edge TTS for cross-platform compatibility
     }));
     
-    const plugin = await SmartVoiceNotifyPlugin({
+    const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
       project: { name: 'TestProject' },
       client: mockClient,
       $: mockShell
-    });
+    }));
     
     await plugin.event({ event: mockEvents.sessionIdle('s1') });
     
@@ -213,11 +214,11 @@ describe('Plugin E2E (Reminder Flow)', () => {
       idleReminderTTSMessages: customMessages
     }));
     
-    const plugin = await SmartVoiceNotifyPlugin({
+    const plugin = trackPlugin(await SmartVoiceNotifyPlugin({
       project: { name: 'TestProject' },
       client: mockClient,
       $: mockShell
-    });
+    }));
     
     await plugin.event({ event: mockEvents.sessionIdle('s1') });
     
