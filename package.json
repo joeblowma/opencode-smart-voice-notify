@@ -1,13 +1,23 @@
 {
   "name": "opencode-smart-voice-notify",
-  "version": "1.4.0",
-  "description": "Smart voice notification plugin for OpenCode with multiple TTS engines (ElevenLabs, Edge TTS, Windows SAPI), AI-generated dynamic messages, and intelligent reminder system",
+  "version": "1.5.0",
+  "description": "Smart voice notification plugin for OpenCode (V1 + V2) with multiple TTS engines (ElevenLabs, Edge TTS, Windows SAPI), AI-generated dynamic messages, and intelligent reminder system",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "build:types": "tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "compile": "tsc -p tsconfig.build.json",
+    "compile:types": "tsc -p tsconfig.build.json --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:watch": "bun test --watch",
@@ -18,6 +28,7 @@
   "keywords": [
     "opencode",
     "opencode-plugins",
+    "opencode-v2",
     "plugin",
     "notification",
     "tts",
@@ -35,7 +46,8 @@
   ],
   "files": [
     "dist/",
-    "assets/"
+    "assets/",
+    "server.js"
   ],
   "repository": {
     "type": "git",
@@ -51,9 +63,12 @@
   },
   "dependencies": {
     "@elevenlabs/elevenlabs-js": "^2.52.0",
+    "@opencode/plugin": "2.0.12",
     "detect-terminal": "^3.0.0",
-    "msedge-tts": "^2.0.5",
     "node-notifier": "^10.0.1"
+  },
+  "optionalDependencies": {
+    "msedge-tts": "^2.0.5"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.17.3"
